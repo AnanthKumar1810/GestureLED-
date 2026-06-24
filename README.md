@@ -1,57 +1,109 @@
-<p align="center">
-  <img src="banner.svg" alt="Finger Pinch LED Controller banner" width="100%">
-</p>
+# Finger Pinch LED Controller
 
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Platform">
-  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs Welcome">
-</p>
+A webcam-based gesture controller that lets you turn a physical LED on or off by pinching your thumb and index finger together. Hand tracking is done on the computer with MediaPipe; the resulting on/off signal is sent to an ESP32 over USB serial, which drives the LED.
 
-<p align="center">
-  Pinch your thumb and index finger together in front of a webcam to turn a real LED on or off — hand tracking via MediaPipe, hardware control via ESP32 over serial.
-</p>
+## How it works
 
-## Demo
+```
+Webcam frame
+   │
+   ▼
+OpenCV reads + flips + color-converts the frame
+   │
+   ▼
+MediaPipe HandLandmarker detects 21 hand landmarks
+   │
+   ▼
+Script reads landmark 4 (thumb tip) and landmark 8 (index tip)
+   │
+   ▼
+Euclidean distance between the two points is calculated
+   │
+   ▼
+distance < THRESHOLD ?
+   ├── yes → send '1' over serial → ESP32 sets LED pin HIGH
+   └── no  → send '0' over serial → ESP32 sets LED pin LOW
+```
 
-> _Add a screenshot or short GIF here showing the pinch gesture toggling the LED — this is the first thing visitors will look at._
+Step by step:
 
-## Instructions
+1. **Capture** — OpenCV grabs a frame from the webcam and flips it horizontally so it behaves like a mirror.
+2. **Detect** — The frame is converted to RGB and passed into MediaPipe's `HandLandmarker`, which returns 21 (x, y, z) points per detected hand. Coordinates come back normalized between 0 and 1, so the script multiplies by the frame's width/height to get actual pixel positions.
+3. **Measure** — Only two of the 21 points matter for this gesture: landmark `4` (thumb tip) and landmark `8` (index fingertip). `math.hypot()` computes the straight-line pixel distance between them.
+4. **Decide** — That distance is compared against `THRESHOLD`. Below it, the fingers are "pinched"; above it, they're "open."
+5. **Send** — A single byte (`'1'` or `'0'`) is written to the serial port.
+6. **Act** — The ESP32's firmware reads that byte and sets a GPIO pin HIGH or LOW, turning the LED on or off.
 
-### 1. Requirements
+## Hardware components
 
-**Hardware**
-- A webcam
-- An ESP32 board
-- An LED (+ resistor) wired to a GPIO pin on the ESP32
-- A USB cable connecting the ESP32 to your computer
+| Component | Purpose |
+|---|---|
+| Webcam | Captures the video frames used for hand tracking |
+| ESP32 board | Receives the serial command and drives the GPIO pin |
+| LED + resistor | The actual output being switched |
+| USB cable | Carries serial data between the computer and the ESP32 |
 
-**Software**
-- Python 3.9–3.12 (MediaPipe doesn't currently ship pre-built wheels for newer versions — see [Troubleshooting](#troubleshooting))
-- [Arduino IDE](https://www.arduino.cc/en/software) (to flash the ESP32)
+## Software components
 
-### 2. Installation
+| Component | Role |
+|---|---|
+| `OpenCV` (`cv2`) | Reads webcam frames, draws the on-screen overlay, handles color conversion |
+| `MediaPipe` (`HandLandmarker`) | Machine learning model that detects hand landmarks per frame |
+| `pyserial` (`serial`) | Sends bytes from Python to the ESP32 over USB |
+| `hand_landmarker.task` | The trained model file MediaPipe uses; downloaded automatically on first run |
+| ESP32 firmware (Arduino sketch) | Listens on serial and toggles a GPIO pin based on the byte received |
+
+## Project structure
+
+```
+.
+├── finger_control_hub.py     # main script — capture, detect, decide, send
+├── requirements.txt          # opencv-python, mediapipe, pyserial
+├── LICENSE
+├── .gitignore
+└── hand_landmarker.task      # auto-downloaded model file (not committed)
+```
+
+## Code walkthrough
+
+`finger_control_hub.py` is organized into these sections, in order:
+
+**1. Dependency check** — imports `cv2`, `mediapipe`, and `serial` inside `try/except` blocks. If any are missing, it prints the exact `pip install` command needed and exits, instead of crashing with a raw traceback.
+
+**2. Model download** — checks whether `hand_landmarker.task` already exists locally. If not, downloads it once from Google's servers. This file is required by MediaPipe's Tasks API and isn't bundled with the package itself.
+
+**3. Serial connection** — opens `SERIAL_PORT` at `BAUD_RATE`. If the ESP32 isn't connected or the port is wrong, `esp32` is set to `None` and the script keeps running in simulation mode (video + detection, no hardware output).
+
+**4. HandLandmarker setup** — creates the detector with:
+- `num_hands=1` — only track one hand
+- `running_mode=VIDEO` — tells MediaPipe to expect a sequence of timestamped frames (enables frame-to-frame tracking instead of full re-detection every time)
+- `min_hand_detection_confidence`, `min_hand_presence_confidence`, `min_tracking_confidence` — confidence thresholds (0–1) controlling how certain the model must be before accepting a detection
+
+**5. Main loop** — runs once per frame:
+- reads and flips the frame
+- wraps it in an `mp.Image` and calls `landmarker.detect_for_video()` with an increasing timestamp
+- if a hand is found, extracts landmarks 4 and 8, computes the distance, compares to `THRESHOLD`, writes `'1'`/`'0'` to serial, and draws the tracked points, the distance line, and the current state as text on the frame
+- displays the frame and exits the loop when `q` is pressed
+
+**6. Cleanup** — releases the webcam, closes the OpenCV window, closes the MediaPipe landmarker, and closes the serial connection if it was open.
+
+## Setup
 
 ```bash
 git clone https://github.com/<your-username>/<your-repo>.git
 cd <your-repo>
 
 python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS/Linux
-source venv/bin/activate
+venv\Scripts\activate        # Windows
+source venv/bin/activate     # macOS/Linux
 
 pip install -r requirements.txt
 ```
 
-### 3. Flash the ESP32
-
-Upload a sketch that listens on serial and toggles an LED based on the byte it receives:
+Flash the ESP32 with a sketch that listens on serial and toggles a pin:
 
 ```cpp
-#define LED_PIN 2  // change to whichever GPIO your LED is wired to
+#define LED_PIN 2
 
 void setup() {
   Serial.begin(9600);
@@ -61,23 +113,15 @@ void setup() {
 void loop() {
   if (Serial.available() > 0) {
     char command = Serial.read();
-    if (command == '1') {
-      digitalWrite(LED_PIN, HIGH);
-    } else if (command == '0') {
-      digitalWrite(LED_PIN, LOW);
-    }
+    if (command == '1') digitalWrite(LED_PIN, HIGH);
+    else if (command == '0') digitalWrite(LED_PIN, LOW);
   }
 }
 ```
 
-Find your ESP32's serial port:
-- **Windows:** Device Manager → Ports (COM & LPT), e.g. `COM5`
-- **macOS:** `ls /dev/tty.*`
-- **Linux:** `ls /dev/ttyUSB*`
+Find the ESP32's serial port (Windows: Device Manager → Ports; macOS: `ls /dev/tty.*`; Linux: `ls /dev/ttyUSB*`) and set it in `finger_control_hub.py`.
 
-### 4. Configure
-
-Open `finger_control_hub.py` and set:
+## Configuration
 
 | Variable | Description | Default |
 |---|---|---|
@@ -85,90 +129,24 @@ Open `finger_control_hub.py` and set:
 | `BAUD_RATE` | Must match `Serial.begin()` in the Arduino sketch | `9600` |
 | `THRESHOLD` | Pixel distance below which fingers count as "pinched" | `60` |
 
-`THRESHOLD` is a pixel distance, not a real-world unit — it depends on your webcam's resolution and how far your hand is from the camera. The on-screen text shows the live distance value (`Dist: NN`) so you can tune it while pinching/releasing.
+`THRESHOLD` is a pixel distance, not a physical unit — it depends on webcam resolution and distance from the camera. The on-screen `Dist: NN` readout shows the live value so you can tune it.
 
-### 5. Run
+## Usage
 
 ```bash
 python finger_control_hub.py
 ```
 
-On first run, the script downloads MediaPipe's hand landmark model (`hand_landmarker.task`, ~10 MB) into the project folder — this only happens once.
+Press `q` in the video window to quit.
 
-If the ESP32 isn't connected or the port is wrong, the script still runs in **simulation mode**: you'll see the video feed and gesture detection, but no serial data is sent.
+## Troubleshooting
 
-Press **`q`** in the video window to quit.
+- **`ModuleNotFoundError`** — install the missing package: `opencv-python` for `cv2`, `mediapipe` for `mediapipe`, `pyserial` for `serial` (not `serial`, which is a different package).
+- **`AttributeError: module 'mediapipe' has no attribute 'solutions'`** — only relevant if you're adapting older MediaPipe code; this script already uses the current `HandLandmarker` API.
+- **No matching mediapipe version for your Python** — MediaPipe doesn't publish wheels for every Python release. Use Python 3.10–3.12 in a virtual environment.
+- **Webcam won't open** — check it isn't in use by another app, and that camera permission is granted to your terminal/IDE.
+- **LED doesn't respond** — verify `SERIAL_PORT` and `BAUD_RATE` match the ESP32, and that no other program (e.g. the Arduino IDE's Serial Monitor) is holding the port open.
 
-## Closing
+## License
 
-### Additional notes
-
-**Project structure**
-```
-.
-├── finger_control_hub.py     # main script
-├── requirements.txt          # Python dependencies
-├── banner.svg                # README banner
-├── LICENSE
-├── CONTRIBUTING.md
-├── .gitignore
-└── hand_landmarker.task      # auto-downloaded on first run (gitignored)
-```
-
-**Troubleshooting**
-
-<details>
-<summary><code>ModuleNotFoundError: No module named 'cv2' / 'mediapipe' / 'serial'</code></summary>
-
-Install the missing package. Note the package name doesn't always match the import name:
-
-| Import | Install with |
-|---|---|
-| `cv2` | `pip install opencv-python` |
-| `mediapipe` | `pip install mediapipe` |
-| `serial` | `pip install pyserial` (**not** `pip install serial`) |
-
-</details>
-
-<details>
-<summary><code>AttributeError: module 'mediapipe' has no attribute 'solutions'</code></summary>
-
-MediaPipe removed the legacy `mp.solutions` API starting in version `0.10.30`. This script already uses the replacement `HandLandmarker` Tasks API, so you shouldn't hit this running the script as-is.
-
-</details>
-
-<details>
-<summary><code>ERROR: No matching distribution found for mediapipe==X.X.X</code></summary>
-
-MediaPipe doesn't publish wheels for every Python version. If you're on a very new Python release (e.g. 3.13+), use Python 3.10–3.12 in your virtual environment instead.
-
-</details>
-
-<details>
-<summary>Webcam won't open</summary>
-
-Check it isn't already in use by another application (Zoom, Teams, a browser tab, etc.), and that you've granted camera permission to your terminal/IDE.
-
-</details>
-
-<details>
-<summary>LED doesn't respond but the video feed works fine</summary>
-
-- Confirm `SERIAL_PORT` matches the port shown in Device Manager / `ls /dev/tty*`.
-- Confirm `BAUD_RATE` matches `Serial.begin()` in the Arduino sketch.
-- Close any other program (including the Arduino IDE's Serial Monitor) that might be holding the port open — only one program can use a serial port at a time.
-
-</details>
-
-### Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting issues and submitting pull requests.
-
-### License
-
-This project is licensed under the [MIT License](LICENSE).
-
-
-<p align="left">
-  <a href="https://www.buymeacoffee.com/<your-username>"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-ffdd00?style=flat&logo=buy-me-a-coffee&logoColor=black" alt="Buy me a coffee"></a>
-</p>
+MIT — see [LICENSE](LICENSE).
